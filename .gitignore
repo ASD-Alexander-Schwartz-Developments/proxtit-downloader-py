@@ -1,3 +1,4 @@
 *.pyc
 bonding_db.json
 graph.svg
+*.csv

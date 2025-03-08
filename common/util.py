@@ -32,6 +32,8 @@ import socket
 import sys
 import threading
 import traceback
+import struct
+from datetime import datetime
 import bgapi
 from bgapi.connector import ConnectorException
 import serial.tools.list_ports
@@ -41,6 +43,24 @@ LOG_FORMAT_SINGLE = "%(asctime)s: %(levelname)s - %(message)s"
 LOG_FORMAT = "%(asctime)s: %(name)s %(levelname)s - %(message)s"
 BT_XAPI = os.path.join(os.path.dirname(__file__), "../api/sl_bt.xapi")
 BTMESH_XAPI = os.path.join(os.path.dirname(__file__), "../api/sl_btmesh.xapi")
+
+
+GAPP_CMD_GETNFILES = 	    1
+GAPP_CMD_FINDFILE =		    2
+GAPP_CMD_UPDATERECIPE =	    3
+GAPP_CMD_UPDATERCOMMIT =	4
+GAPP_CMD_STOPDNLD =	        6
+GAPP_CMD_STARTDNLD =	    7
+GAPP_CMD_RELEASE =		    8
+GAPP_CMD_GETTIME =		    9
+GAPP_CMD_SETTIME =		    0x0A
+GAPP_CMD_GETSTATUS =		0x0F
+GAPP_CMD_SETCFG =		    0x10											
+GAPP_CMD_GETCFG =			0x11											
+GAPP_CMD_GETPAGE =			0x12
+
+
+
 
 # Patch bgapi package to use a modified version of CommandFailedError
 class CommandFailedError(bgapi.bglib.CommandError):
@@ -408,3 +428,156 @@ def find_service_in_advertisement(adv_data, uuid):
             return False
     # UUID not found.
     return False
+
+
+def unix_timestamp_to_datetime(unix_timestamp):
+    # Convert the Unix timestamp to a datetime object
+    dt = datetime.fromtimestamp(unix_timestamp)
+    return dt
+
+def find_name_in_advertisement(adv_data, name):
+    """ Find service with the given UUID in the advertising data. """
+    if len(name) != 3 :
+        raise ValueError("Invalid Name length.")
+    
+    complete_name = 0x09
+    # Parse advertisement packet.
+    i = 0
+    while i < len(adv_data):
+        try:
+            ad_field_length = adv_data[i]
+            ad_field_type = adv_data[i + 1]
+            # Find AD types of interest.
+            if ad_field_type == complete_name:
+                ad_uuid_count = int((ad_field_length - 1) / len(name))
+                # Compare each name to the service name to be found.
+                for j in range(ad_uuid_count):
+                    start_idx = i + 2 + j*len(name)
+                    # Get name from AD data.
+                    ad_name = adv_data[start_idx: start_idx + len(name)].decode(encoding="utf-8")
+                    if ad_name == name:
+                        return True
+            # Advance to the next AD structure.
+            i += ad_field_length + 1
+        except IndexError:
+            # Malformed advertising data
+            return False
+    # name not found.
+    return False
+
+def find_logs_in_advertisement(adv_data):  # [bool, addr, datetime, mode, type, txpwr, batcap, logs]
+    mfr_data = 0xff
+
+    # Parse advertisement packet.
+    i = 0
+    while i < len(adv_data):
+        try:
+            ad_field_length = adv_data[i]
+            ad_field_type = adv_data[i + 1]
+            # Find AD types of interest.
+            if ad_field_type == mfr_data and ad_field_length == 21:
+                start_idx = i + 2 + 2
+
+                rtxper = int.from_bytes(adv_data[start_idx: start_idx+1], byteorder='little', signed=True)
+                start_idx += 1
+                rbatcap = int.from_bytes(adv_data[start_idx: start_idx+1], byteorder='little', signed=False)
+                start_idx += 1
+
+                unixtd = struct.unpack('<I', adv_data[start_idx: start_idx+4])[0] 
+
+                rdt = unix_timestamp_to_datetime(unixtd)
+                start_idx += 4
+                revaddr = reversed(adv_data[start_idx: start_idx+6])
+                addr = ''.join('{:02x}:'.format(x) for x in revaddr) 
+                addr = addr[:-1]
+                start_idx += 6
+                mode = int.from_bytes(adv_data[start_idx: start_idx+1], byteorder='little', signed=False)
+                start_idx += 1
+                rtype = int.from_bytes(adv_data[start_idx: start_idx+1], byteorder='little', signed=False)
+                start_idx += 1
+                rlogs = struct.unpack('<I', adv_data[start_idx: start_idx+4])[0]
+                start_idx += 4
+                return (True, addr, rdt, mode, rtype, rtxper, rbatcap, rlogs)
+            # Advance to the next AD structure.
+            i += ad_field_length + 1
+        except IndexError:
+            # Malformed advertising data
+            return (False, '', datetime.now(), 0, 0, 0, 0, 0)
+    # Not found.
+    return (False, '', datetime.now(), 0, 0, 0, 0, 0)
+
+
+def bytes_to_datetime(byte_array):
+    # Unpack the bytes into the corresponding fields
+    # Define the C struct format
+    struct_format = 'BBBBBBH'
+    unpacked_data = struct.unpack(struct_format, byte_array)
+
+    # Extract the individual fields
+    year, month, day, hour, minute, second, millisecond = unpacked_data
+
+    # Convert the year to a full year (assuming base year is 2000)
+    year += 1900
+    month += 1
+
+    # Create and return a datetime object
+    return datetime(year, month, day, hour, minute, second, millisecond * 1000)
+
+def datetime_to_bytes(dt):
+    # Define the C struct format
+    struct_format = 'BBBBBBH'
+    # Extract the individual fields from the datetime object
+    year = dt.year - 1900  # Assuming base year is 1900
+    month = dt.month - 1
+    day = dt.day
+    hour = dt.hour
+    minute = dt.minute
+    second = dt.second
+    millisecond = int(dt.microsecond / 1000)  # Convert microseconds to milliseconds
+
+    # Pack the fields into a byte array
+    byte_array = struct.pack(struct_format, year, month, day, hour, minute, second, millisecond)
+
+    return byte_array
+
+
+def curdatetime_to_bytes():
+    return datetime_to_bytes(datetime.now())
+
+
+def encode_set_rtc_cmd():
+    return bytes([GAPP_CMD_SETTIME]) + (curdatetime_to_bytes())
+
+def encode_get_rtc_cmd():
+    existing_bytes = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    return bytes([GAPP_CMD_GETTIME]) + (existing_bytes)
+
+def decode_log(addr, array_of_bytes):
+    r = False
+
+    start_time = datetime.now()
+    seconds_duration = 0
+
+    unit1 = addr
+    unit2 = '00:00:00:00:00:00'
+    rssi = -999
+    tx_power = -999
+
+    if(len(array_of_bytes) >= 16):
+        i = 0
+        unixtd = struct.unpack('<I', array_of_bytes[i: i+4])[0] 
+        start_time = unix_timestamp_to_datetime(unixtd)
+        i+=4
+        seconds_duration = struct.unpack('<I', array_of_bytes[i: i+4])[0] 
+        i+=4
+        revaddr = reversed(array_of_bytes[i: i+6])
+        unit2 = ''.join('{:02x}:'.format(x) for x in revaddr) 
+        unit2 = unit2[:-1]
+        i += 6
+        rssi = int.from_bytes(array_of_bytes[i: i+1], byteorder='little', signed=True)
+        i += 1
+        tx_power = int.from_bytes(array_of_bytes[i: i+1], byteorder='little', signed=True)
+        i += 1
+        r = True
+    
+    return (r, unit1, unit2, rssi, tx_power, start_time, seconds_duration)
